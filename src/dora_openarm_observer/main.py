@@ -12,18 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Node to collect the last observation."""
+"""Collect synchronized OpenArm observations for a policy."""
 
 import argparse
+import os
+import time
+from collections import deque
+
 import cv2
 import dora
-import os
 import pyarrow as pa
-import time
+
+
+QPOS_TYPE = pa.struct([("qpos", pa.list_(pa.float32()))])
+START_COMMANDS = {"start"}
+STOP_COMMANDS = {"stop", "intervene", "quit"}
 
 
 def _reset_observation(observation, arms):
-    """Initialize/reset observations to None and ID to 0."""
+    """Clear inputs so every episode starts from freshly received data."""
+    observation.clear()
     if "right" in arms:
         observation["arm_right"] = None
         observation["camera_wrist_right"] = None
@@ -36,52 +44,37 @@ def _reset_observation(observation, arms):
     observation["id"] = 0
 
 
+def _qpos(value):
+    """Extract qpos from the canonical length-one OpenArm payload."""
+    if value.type != QPOS_TYPE or len(value) != 1:
+        raise ValueError(
+            "Arm position must be a length-one struct<qpos: list<float32>>"
+        )
+    qpos = value.field("qpos")[0]
+    if not qpos.is_valid:
+        raise ValueError("Arm position qpos cannot be null")
+    return qpos.values
+
+
 def _build_output(observation, phase_classifier_result, task_prompt, metadata):
-    """Convert observation to Apache Arrow data and fill metadata.
-
-    observation keys (all values are dora events with a "value" field):
-      "arm_right"          – pa.array float32, len 8 (7 joints + 1 gripper)
-      "arm_left"           – pa.array float32, len 8
-      "camera_wrist_right" – JPEG-encoded uint8 flat array, 960×600
-      "camera_wrist_left"  – JPEG-encoded uint8 flat array, 960×600
-      "camera_head_left"   – JPEG-encoded uint8 flat array, 1280×720
-      "camera_head_right"  – JPEG-encoded uint8 flat array, 1280×720
-      "camera_ceiling"     – JPEG-encoded uint8 flat array, 960×600
-      "id"                 – int64, incremented for each observation
-
-    Output pa.StructArray fields:
-      "position"           – concatenated arm positions, list<float32>
-      "camera_wrist_right" – decoded RGB flat array, list<uint8>
-      "camera_wrist_left"  – decoded RGB flat array, list<uint8>
-      "camera_head_left"   – decoded RGB flat array, list<uint8>
-      "camera_head_right"  – decoded RGB flat array, list<uint8>
-      "camera_ceiling"     – decoded RGB flat array, list<uint8>
-      "phase_classifier_result" – StructArray or null
-      "task_prompt"        – string (language instruction for the policy)
-      "id"                 – int64, incremented for each observation
-
-    metadata is mutated to add per-camera height/width/encoding keys.
-    """
-    arrays = []
-    names = []
-    position_arrays = []
+    """Build one policy observation from the latest synchronized inputs."""
+    positions = []
     if "arm_right" in observation:
-        position_arrays.append(observation["arm_right"]["value"])
+        positions.append(_qpos(observation["arm_right"]["value"]))
     if "arm_left" in observation:
-        position_arrays.append(observation["arm_left"]["value"])
-    arrays.append(
-        pa.array(
-            [pa.concat_arrays(position_arrays)], type=pa.list_(position_arrays[0].type)
-        )
-    )
-    names.append("position")
+        positions.append(_qpos(observation["arm_left"]["value"]))
 
-    def add_camera_observation(name):
-        camera = observation[name]
-        image = cv2.imdecode(
-            camera["value"].to_numpy(),
-            cv2.IMREAD_UNCHANGED,
+    arrays = [
+        pa.array(
+            [pa.concat_arrays(positions)],
+            type=pa.list_(pa.float32()),
         )
+    ]
+    names = ["position"]
+
+    def add_camera(name):
+        camera = observation[name]
+        image = cv2.imdecode(camera["value"].to_numpy(), cv2.IMREAD_UNCHANGED)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         metadata[f"{name}.encoding"] = "rgb8"
         metadata[f"{name}.height"] = image.shape[0]
@@ -90,16 +83,16 @@ def _build_output(observation, phase_classifier_result, task_prompt, metadata):
         names.append(name)
 
     if "camera_wrist_right" in observation:
-        add_camera_observation("camera_wrist_right")
+        add_camera("camera_wrist_right")
     if "camera_wrist_left" in observation:
-        add_camera_observation("camera_wrist_left")
-    add_camera_observation("camera_head_left")
-    add_camera_observation("camera_head_right")
-    add_camera_observation("camera_ceiling")
-    if phase_classifier_result is None:
-        arrays.append(pa.array([None]))
-    else:
-        arrays.append(phase_classifier_result)
+        add_camera("camera_wrist_left")
+    add_camera("camera_head_left")
+    add_camera("camera_head_right")
+    add_camera("camera_ceiling")
+
+    arrays.append(
+        pa.array([None]) if phase_classifier_result is None else phase_classifier_result
+    )
     names.append("phase_classifier_result")
     arrays.append(pa.array([task_prompt], type=pa.string()))
     names.append("task_prompt")
@@ -108,62 +101,140 @@ def _build_output(observation, phase_classifier_result, task_prompt, metadata):
     return pa.StructArray.from_arrays(arrays, names)
 
 
+def _parse_delta_indices(value):
+    """Parse non-positive policy history frame offsets."""
+    indices = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    if not indices:
+        raise ValueError("At least one policy history delta index is required")
+    if any(index > 0 for index in indices):
+        raise ValueError("Policy history delta indices must be non-positive")
+    return indices
+
+
+def _select_history(history, latest_timestamp, delta_indices, history_hz):
+    """Select nearest frames and pad startup history with this episode's first."""
+    if not history:
+        raise ValueError("Cannot select from empty policy history")
+
+    selected = []
+    selected_timestamps = []
+    for delta_index in delta_indices:
+        target = latest_timestamp + int(delta_index / history_hz * 1_000_000_000)
+        timestamp, observation = min(
+            history,
+            key=lambda item: abs(item[0] - target),
+        )
+        selected.append(observation)
+        selected_timestamps.append(timestamp)
+    return pa.concat_arrays(selected), selected_timestamps
+
+
 def main():
-    """Collect the last observation."""
-    parser = argparse.ArgumentParser(description="Collect the last observation")
+    """Collect and publish observations while an episode is active."""
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--arms",
         default=os.getenv("ARMS", "right,left"),
-        help="The used arms: 'right,left' (default), 'right' or 'left'",
-        type=str,
+        help="Comma-separated arm sides",
+    )
+    parser.add_argument(
+        "--policy-history-hz",
+        default=float(os.getenv("POLICY_HISTORY_HZ", "30.0")),
+        type=float,
+        help="Sampling rate used to interpret policy history offsets",
+    )
+    parser.add_argument(
+        "--policy-history-delta-indices",
+        default=os.getenv("POLICY_HISTORY_DELTA_INDICES", "0"),
+        help="Comma-separated policy history offsets, for example '-32,0'",
     )
     args = parser.parse_args()
+
     arms = args.arms.split(",")
+    if not arms or any(arm not in {"right", "left"} for arm in arms):
+        raise ValueError("--arms must contain only 'right' and/or 'left'")
+    if args.policy_history_hz <= 0:
+        raise ValueError("--policy-history-hz must be positive")
+
+    delta_indices = _parse_delta_indices(args.policy_history_delta_indices)
+    history_window_ns = int(
+        (abs(min(delta_indices)) / args.policy_history_hz + 0.1) * 1_000_000_000
+    )
+
     node = dora.Node()
     observation = {}
     _reset_observation(observation, arms)
+    policy_history = deque()
+
+    episode_active = False
     episode_number = 0
+    inference_trial_id = 0
+    arm_status = {"right": None, "left": None}
     last_phase_classifier_result = None
     last_task_prompt = None
-    last_arm_right_status = None
-    last_arm_left_status = None
-    command_status = "stopped"
+
     for event in node:
         if event["type"] != "INPUT":
             continue
 
-        # Main process
         event_id = event["id"]
         if event_id == "tick":
-            if any(v is None for v in observation.values()):
-                # If any observation isn't ready yet, we skip this tick.
+            if any(value is None for value in observation.values()):
                 continue
-            if (
-                ("right" in arms and last_arm_right_status == "stopped")
-                or ("left" in arms and last_arm_left_status == "stopped")
-                or command_status == "stopped"
-            ):
+            if not episode_active or any(arm_status[arm] == "stopped" for arm in arms):
+                policy_history.clear()
                 _reset_observation(observation, arms)
                 continue
+
+            timestamp = time.time_ns()
             metadata = {
                 "episode_number": episode_number,
-                "timestamp": time.time_ns(),
+                "inference_trial_id": inference_trial_id,
+                "timestamp": timestamp,
+                "history_hz": args.policy_history_hz,
+                "history_delta_indices": ",".join(map(str, delta_indices)),
             }
-            arrow_observation = _build_output(
-                observation, last_phase_classifier_result, last_task_prompt, metadata
-            )
-            node.send_output(
-                "observation",
-                arrow_observation,
+            current = _build_output(
+                observation,
+                last_phase_classifier_result,
+                last_task_prompt,
                 metadata,
             )
+            policy_history.append((timestamp, current))
+            while (
+                policy_history and policy_history[0][0] < timestamp - history_window_ns
+            ):
+                policy_history.popleft()
+
+            output, history_timestamps = _select_history(
+                policy_history,
+                timestamp,
+                delta_indices,
+                args.policy_history_hz,
+            )
+            metadata["history_timestamps"] = ",".join(map(str, history_timestamps))
+            node.send_output("observation", output, metadata)
             observation["id"] += 1
+
         elif event_id == "command":
-            command_status = event["value"][0].as_py()  # started, stopped, aligned
+            command = event["value"][0].as_py()
+            if command in START_COMMANDS:
+                episode_active = True
+                episode_number = int(
+                    event["metadata"].get("episode_number", episode_number)
+                )
+                inference_trial_id += 1
+                policy_history.clear()
+                _reset_observation(observation, arms)
+            elif command in STOP_COMMANDS:
+                episode_active = False
+                policy_history.clear()
+                _reset_observation(observation, arms)
+
         elif event_id == "arm_right_status":
-            last_arm_right_status = event["value"][0].as_py()
+            arm_status["right"] = event["value"][0].as_py()
         elif event_id == "arm_left_status":
-            last_arm_left_status = event["value"][0].as_py()
+            arm_status["left"] = event["value"][0].as_py()
         elif event_id == "phase_classifier_result":
             last_phase_classifier_result = event["value"]
         elif event_id == "task_prompt":
