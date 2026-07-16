@@ -15,11 +15,31 @@
 """Node to collect the last observation."""
 
 import argparse
+from collections import deque
+import os
+import time
+
 import cv2
 import dora
-import os
 import pyarrow as pa
-import time
+
+
+START_COMMANDS = {
+    "start",
+    "started",
+    "aligned",
+}
+STOP_COMMANDS = {
+    "stop",
+    "stop_arm",
+    "pause",
+    "cancel",
+    "success",
+    "fail",
+    "intervene",
+    "quit",
+    "stopped",
+}
 
 
 def _reset_observation(observation, arms):
@@ -108,6 +128,40 @@ def _build_output(observation, phase_classifier_result, task_prompt, metadata):
     return pa.StructArray.from_arrays(arrays, names)
 
 
+def _parse_delta_indices(text):
+    delta_indices = []
+    for part in text.split(","):
+        part = part.strip()
+        if part:
+            delta_indices.append(int(part))
+    if not delta_indices:
+        raise ValueError("at least one policy history delta index is required")
+    return tuple(delta_indices)
+
+
+def _build_policy_output(policy_history, latest_timestamp, delta_indices, history_hz):
+    selected = []
+    selected_timestamps = []
+    for delta_index in delta_indices:
+        target_timestamp = latest_timestamp + int(
+            delta_index / history_hz * 1_000_000_000
+        )
+        item = min(
+            policy_history,
+            key=lambda history_item: abs(history_item["timestamp"] - target_timestamp),
+        )
+        selected.append(item["arrow"])
+        selected_timestamps.append(item["timestamp"])
+    return pa.concat_arrays(selected), selected_timestamps
+
+
+def _metadata_int(metadata, key, default):
+    try:
+        return int(metadata.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
 def main():
     """Collect the last observation."""
     parser = argparse.ArgumentParser(description="Collect the last observation")
@@ -117,17 +171,38 @@ def main():
         help="The used arms: 'right,left' (default), 'right' or 'left'",
         type=str,
     )
+    parser.add_argument(
+        "--policy-history-hz",
+        default=float(os.getenv("POLICY_HISTORY_HZ", "30.0")),
+        help="History sampling rate used to interpret policy history delta indices",
+        type=float,
+    )
+    parser.add_argument(
+        "--policy-history-delta-indices",
+        default=os.getenv("POLICY_HISTORY_DELTA_INDICES", "0"),
+        help="Comma-separated history offsets to send to the policy, e.g. '-32,0'",
+        type=str,
+    )
     args = parser.parse_args()
     arms = args.arms.split(",")
+    if args.policy_history_hz <= 0:
+        raise ValueError("--policy-history-hz must be positive")
+    policy_delta_indices = _parse_delta_indices(args.policy_history_delta_indices)
+    history_keep_ns = int(
+        (abs(min(policy_delta_indices)) / args.policy_history_hz + 0.1) * 1_000_000_000
+    )
+
     node = dora.Node()
     observation = {}
     _reset_observation(observation, arms)
     episode_number = 0
+    inference_trial_id = 0
+    episode_active = False
+    policy_history = deque()
     last_phase_classifier_result = None
     last_task_prompt = None
     last_arm_right_status = None
     last_arm_left_status = None
-    command_status = "stopped"
     for event in node:
         if event["type"] != "INPUT":
             continue
@@ -141,25 +216,61 @@ def main():
             if (
                 ("right" in arms and last_arm_right_status == "stopped")
                 or ("left" in arms and last_arm_left_status == "stopped")
-                or command_status == "stopped"
+                or not episode_active
             ):
                 _reset_observation(observation, arms)
+                policy_history.clear()
                 continue
             metadata = {
                 "episode_number": episode_number,
+                "inference_trial_id": inference_trial_id,
                 "timestamp": time.time_ns(),
+                "history_hz": args.policy_history_hz,
+                "history_delta_indices": ",".join(str(i) for i in policy_delta_indices),
             }
             arrow_observation = _build_output(
                 observation, last_phase_classifier_result, last_task_prompt, metadata
             )
+            policy_history.append(
+                {
+                    "timestamp": metadata["timestamp"],
+                    "arrow": arrow_observation,
+                }
+            )
+            while (
+                policy_history
+                and policy_history[0]["timestamp"] < metadata["timestamp"] - history_keep_ns
+            ):
+                policy_history.popleft()
+            history_observation, history_timestamps = _build_policy_output(
+                policy_history,
+                metadata["timestamp"],
+                policy_delta_indices,
+                args.policy_history_hz,
+            )
+            metadata["history_timestamps"] = ",".join(
+                str(ts) for ts in history_timestamps
+            )
             node.send_output(
                 "observation",
-                arrow_observation,
+                history_observation,
                 metadata,
             )
             observation["id"] += 1
         elif event_id == "command":
-            command_status = event["value"][0].as_py()  # started, stopped, aligned
+            command = event["value"][0].as_py()
+            if command in START_COMMANDS:
+                episode_active = True
+                episode_number = _metadata_int(
+                    event["metadata"], "episode_number", episode_number
+                )
+                policy_history.clear()
+                _reset_observation(observation, arms)
+            elif command in STOP_COMMANDS:
+                episode_active = False
+                inference_trial_id = (inference_trial_id + 1) % (2**63 - 1)
+                policy_history.clear()
+                _reset_observation(observation, arms)
         elif event_id == "arm_right_status":
             last_arm_right_status = event["value"][0].as_py()
         elif event_id == "arm_left_status":
