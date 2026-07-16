@@ -12,15 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regression tests for parallel observer image decoding."""
+"""Tests for parallel decoding, canonical qpos, and history selection."""
 
+# ruff: noqa: D103
+
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
 import pyarrow as pa
+import pytest
 
-from dora_openarm_observer.main import _build_output
+from dora_openarm_observer.main import (
+    QPOS_TYPE,
+    _build_output,
+    _parse_delta_indices,
+    _qpos,
+    _select_history,
+)
 
 
 def _camera_event(value):
@@ -30,11 +40,15 @@ def _camera_event(value):
     return {"value": pa.array(jpeg, type=pa.uint8())}
 
 
+def _qpos_event(values):
+    return {"value": pa.array([{"qpos": values}], type=QPOS_TYPE)}
+
+
 def test_parallel_decode_preserves_mainline_output_format():
     """Parallel decoding keeps the existing Arrow schema and qpos values."""
     observation = {
-        "arm_right": {"value": pa.array([1.0, 2.0], type=pa.float32())},
-        "arm_left": {"value": pa.array([3.0, 4.0], type=pa.float32())},
+        "arm_right": _qpos_event([1.0, 2.0]),
+        "arm_left": _qpos_event([3.0, 4.0]),
         "camera_wrist_right": _camera_event(10),
         "camera_wrist_left": _camera_event(20),
         "camera_head_left": _camera_event(30),
@@ -66,3 +80,54 @@ def test_parallel_decode_preserves_mainline_output_format():
     assert metadata["camera_ceiling.encoding"] == "rgb8"
     assert metadata["camera_ceiling.height"] == 2
     assert metadata["camera_ceiling.width"] == 3
+
+
+def test_qpos_accepts_only_canonical_payload():
+    value = pa.array([{"qpos": [1.0, 2.0]}], type=QPOS_TYPE)
+
+    assert _qpos(value).to_pylist() == [1.0, 2.0]
+
+
+def test_qpos_rejects_legacy_flat_payload():
+    with pytest.raises(ValueError, match="struct<qpos"):
+        _qpos(pa.array([1.0, 2.0], type=pa.float32()))
+
+
+def test_history_pads_startup_from_current_episode():
+    timestamp = 2_000_000_000
+    history = deque([(timestamp, pa.array([7]))])
+
+    output, selected_timestamps = _select_history(
+        history,
+        latest_timestamp=timestamp,
+        delta_indices=(-32, 0),
+        history_hz=30.0,
+    )
+
+    assert output.to_pylist() == [7, 7]
+    assert selected_timestamps == [timestamp, timestamp]
+
+
+def test_history_selects_nearest_available_frames():
+    history = deque(
+        [
+            (0, pa.array([0])),
+            (1_000_000_000, pa.array([1])),
+            (2_000_000_000, pa.array([2])),
+        ]
+    )
+
+    output, selected_timestamps = _select_history(
+        history,
+        latest_timestamp=2_000_000_000,
+        delta_indices=(-30, 0),
+        history_hz=30.0,
+    )
+
+    assert output.to_pylist() == [1, 2]
+    assert selected_timestamps == [1_000_000_000, 2_000_000_000]
+
+
+def test_future_history_offsets_are_rejected():
+    with pytest.raises(ValueError, match="non-positive"):
+        _parse_delta_indices("0,1")
