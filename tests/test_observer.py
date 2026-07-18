@@ -25,8 +25,10 @@ import pyarrow as pa
 import pytest
 
 from dora_openarm_observer.main import (
-    QPOS_TYPE,
+    _ObservationSnapshot,
     _build_output,
+    _build_snapshot,
+    QPOS_TYPE,
     _parse_delta_indices,
     _qpos,
     _select_history,
@@ -45,7 +47,6 @@ def _qpos_event(values):
 
 
 def test_parallel_decode_preserves_mainline_output_format():
-    """Parallel decoding keeps the existing Arrow schema and qpos values."""
     observation = {
         "arm_right": _qpos_event([1.0, 2.0]),
         "arm_left": _qpos_event([3.0, 4.0]),
@@ -59,7 +60,8 @@ def test_parallel_decode_preserves_mainline_output_format():
     metadata = {}
 
     with ThreadPoolExecutor(max_workers=3) as decode_pool:
-        output = _build_output(observation, None, "pick", metadata, decode_pool)
+        snapshot = _build_snapshot(observation, None, "pick", decode_pool)
+    output = _build_output([snapshot], metadata)
 
     assert output.type.names == [
         "position",
@@ -131,3 +133,33 @@ def test_history_selects_nearest_available_frames():
 def test_future_history_offsets_are_rejected():
     with pytest.raises(ValueError, match="non-positive"):
         _parse_delta_indices("0,1")
+
+
+def test_selected_snapshots_build_one_dense_history_output():
+    snapshots = [
+        _ObservationSnapshot(
+            position=np.array([index, index + 0.5], dtype=np.float32),
+            cameras={"camera_ceiling": np.full((2, 3, 3), index, dtype=np.uint8)},
+            phase_classifier_result=None,
+            phase_classifier_type=None,
+            task_prompt=f"task-{index}",
+            observation_id=index,
+        )
+        for index in (1, 2)
+    ]
+    metadata = {}
+
+    output = _build_output(snapshots, metadata)
+
+    assert output.field("position").to_pylist() == [[1.0, 1.5], [2.0, 2.5]]
+    camera = output.field("camera_ceiling")
+    assert camera.offsets.to_pylist() == [0, 18, 36]
+    assert camera[0].values.to_pylist() == [1] * 18
+    assert camera[1].values.to_pylist() == [2] * 18
+    assert output.field("task_prompt").to_pylist() == ["task-1", "task-2"]
+    assert output.field("id").to_pylist() == [1, 2]
+    assert metadata == {
+        "camera_ceiling.encoding": "rgb8",
+        "camera_ceiling.height": 2,
+        "camera_ceiling.width": 3,
+    }
