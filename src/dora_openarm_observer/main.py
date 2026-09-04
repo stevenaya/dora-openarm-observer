@@ -447,6 +447,7 @@ def main():
 
     episode_active = False
     episode_number = 0
+    episode_attempt_id = None
     last_phase_classifier_result = None
     last_task_prompt = None
     last_arm_right_status = None
@@ -486,6 +487,8 @@ def main():
                     "history_hz": args.policy_history_hz,
                     "history_delta_indices": ",".join(map(str, delta_indices)),
                 }
+                if episode_attempt_id is not None:
+                    metadata["episode_attempt_id"] = episode_attempt_id
                 snapshot = _build_snapshot(
                     observation,
                     last_phase_classifier_result,
@@ -534,12 +537,14 @@ def main():
                     episode_number = int(
                         event["metadata"].get("episode_number", episode_number)
                     )
+                    episode_attempt_id = event["metadata"].get("episode_attempt_id")
                     policy_history.clear()
                     timing_window.reset()
                     last_output_start_ns = None
                     _reset_observation(observation, arms)
                 elif command in STOP_COMMANDS:
                     episode_active = False
+                    episode_attempt_id = None
                     policy_history.clear()
                     timing_window.reset()
                     last_output_start_ns = None
@@ -553,6 +558,12 @@ def main():
                 last_phase_classifier_result = event["value"]
             elif event_id == "task_prompt":
                 last_task_prompt = event["value"][0].as_py()
+                episode_number = int(
+                    event["metadata"].get("episode_number", episode_number)
+                )
+                episode_attempt_id = event["metadata"].get(
+                    "episode_attempt_id", episode_attempt_id
+                )
             else:
                 observation[event_id] = event
     finally:
