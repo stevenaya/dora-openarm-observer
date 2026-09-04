@@ -2,6 +2,11 @@
 
 A [Dora](https://dora-rs.ai/) node that collects the last observation for OpenArm.
 
+## Documentation
+
+- [Observation history](docs/observation-history.md): canonical arm inputs,
+  episode-scoped history selection, and output metadata.
+
 ## License
 
 Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
